@@ -1,0 +1,367 @@
+import { window } from '@kit.ArkUI';
+import {CameraService} from '../services/CameraService'
+import { common } from '@kit.AbilityKit';
+import { image } from '@kit.ImageKit';
+import { AiModelManager } from '../model/AiModelManager';
+
+// 核心：25类模型类别映射表（必须和你训练时data.yaml的names顺序完全一致！）
+// 请务必补充完整25类，顺序不能乱（示例仅写10类，替换为你的实际类别）
+const CLASS_MAP = [
+ "level1_damage","level1_normal","level1_position_error","level1_stain","level1_wrinkle",
+    "level2_damage","level2_normal","level2_position_error","level2_stain","level2_wrinkle",
+    "level3_damage","level3_normal","level3_position_error","level3_stain","level3_wrinkle",
+    "level4_damage","level4_normal","level4_position_error","level4_stain","level4_wrinkle",
+    "level5_damage","level5_normal","level5_position_error","level5_stain","level5_wrinkle"
+];
+
+// 辅助：缺陷类型中文映射（适配前端展示）
+const DEFECT_TYPE_MAP = {
+  "normal": "无缺陷",
+  "damage": "破损",
+  "stain": "污渍",
+  "wrinkle": "褶皱",
+  "position_error": "位置偏移"
+};
+
+export interface HistoryItem {
+  productId: string;      // 产品编号
+  productModel: string;   // 产品型号
+  isQualified: boolean;   // 是否合格
+  energyLevel?: number;
+  energyLabel?: Resource; // 能效标签（可选）
+  inspectionRate?: number; // 检验率（不合格时）
+  hasDefect?: boolean;    // 缺陷与否（不合格时）
+  defectType?: string;
+  offset?: string;        // 位置偏移量（不合格时）
+}
+
+interface DetectionResult {
+  label: string;
+  value: string;
+  visible?: boolean;
+}
+
+// 新增：用于传递能效等级的回调类型（衔接两个函数）
+type EnergyLevelCallback = (energyLevel: number) => void;
+
+@Component
+export struct Test { // 加 export 才能被外部引用
+  @Consume('pageStack') pageStack: NavPathStack;
+  @State statusBarHeight: number = 0;
+  @State isShowResult: boolean = false;
+  @State currentPixelMap: image.PixelMap | undefined = undefined;
+  @State frameCount: number = 0; // 用于节流的计数器
+  @State detectResult: string = "等待检测...";
+  @State results: DetectionResult[] = [
+    { label: '校验率', value: '等待中...' },
+    { label: '缺陷与否', value: '等待中...' },
+    { label: '偏移量', value: '等待中...'}
+  ];
+  @State isModelLoaded: boolean = false; // 【新增】模型加载状态
+  @State loadingText: string = "模型加载中..."; // 【新增】加载文案
+  @StorageLink('globalHistoryList') historyList: HistoryItem[] = [];
+
+  // 在组件生命周期中获取真实高度
+  async aboutToAppear() {
+    window.getLastWindow(getContext(this)).then(win => {
+      // 获取系统规避区域（状态栏）
+      let avoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      // 关键：将 px 转换为 vp 才能直接用于组件属性
+      this.statusBarHeight = px2vp(avoidArea.topRect.height);
+      console.info('状态栏高度已获取: ' + this.statusBarHeight);
+    })
+
+    // 2. 在页面初始化时，异步加载 AI 模型
+    try {
+      let context = getContext(this);
+      await this.aiManager.initModel(context.resourceManager);
+      this.isModelLoaded = true; // 加载完成
+    } catch (e) {
+      this.loadingText = "模型加载失败，请检查网络或资源";
+      console.error("Model Init Error: " + e);
+    }
+  }
+
+  private mController: XComponentController = new XComponentController()
+  private cameraService: CameraService = new CameraService();
+  private aiManager: AiModelManager = new AiModelManager(); // 实例化 AI 管理器
+  // 【新增】推理状态锁：防止模型处理不过来导致内存溢出
+  private isInferring: boolean = false;
+
+  build() {
+    NavDestination() {
+      Stack({alignContent:Alignment.Top}){
+        XComponent({
+          id:'camera_preview_test',
+          type:'surface',
+          controller: this.mController
+        })
+          .width('100%')
+          .height('100%')
+          .scale({x:1.8 , y:1.8})
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .onLoad(async ()=>{
+            let surfaceId = this.mController.getXComponentSurfaceId();
+            let context = getContext(this) as common.UIAbilityContext;
+            // 一键启动
+            await this.cameraService.checkAndStartCamera(context, surfaceId);
+          })
+        Column(){
+          Row(){
+            Image($r('sys.media.ohos_ic_back'))
+              .width(28)
+              .height(28)
+              .fillColor(Color.White)
+              .blendMode(BlendMode.DIFFERENCE, BlendApplyType.OFFSCREEN)
+              .onClick(()=>{
+                this.pageStack.pop()
+              })
+            Text('智能检测')
+              .fontColor(Color.White)
+              .blendMode(BlendMode.DIFFERENCE, BlendApplyType.OFFSCREEN)
+              .fontSize(20)
+              .margin({left:16})
+          }
+          .width('100%')
+          .padding({ top: this.statusBarHeight + 20, left: 25 })
+
+          Blank()
+
+          if(this.isShowResult){
+            Column(){
+              // Image(this.currentPixelMap)
+              //   .width(150)
+              //   .height(100)
+              //   .borderRadius(8)
+              //   .margin({ bottom: 20 })
+              ForEach(this.results,(item:DetectionResult)=>{
+                if(item.visible !== false){
+                  Row(){
+                    Text(`${item.label} : `)
+                      .fontSize(32)
+                      .fontColor(Color.Black)
+                      .margin({right:5 , top:10})
+
+                    Text(item.value)
+                      .fontSize(32)
+                      .fontColor(Color.Red)
+                      .margin({top:10})
+                  }
+                  .width('100%')
+                  .justifyContent(FlexAlign.Start)
+                  .margin({bottom:10 ,left:30})
+                }
+              })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width(350)
+            .height(200)
+            .justifyContent(FlexAlign.Center)
+            .margin({
+              bottom:30
+            })
+            .backgroundColor('rgba(255, 255, 255, 0.8)') // 半透明白色背景
+            .borderRadius(15)
+            .shadow({ radius: 20, color: 0x30000000 })
+            .transition({ type: TransitionType.All, opacity: 0, scale: { x: 0.5, y: 0.5 } })
+          }
+
+          Button(){
+            Row() {
+              if (!this.isModelLoaded) {
+                // 展示一个小型的加载环（鸿蒙内置组件）
+                LoadingProgress()
+                  .width(24)
+                  .height(24)
+                  .margin({ right: 12 })
+                  .color(Color.White)
+              }
+              Text(this.isModelLoaded ? "开始检测" : "加载中...")
+                .fontSize(28) // 稍微调小一点，防止转圈圈挤不下
+                .fontColor(Color.White)
+            }
+          }
+          .width(200)
+          .height(60)
+          .backgroundColor(this.isModelLoaded ? Color.Red : Color.Gray)
+          .enabled(this.isModelLoaded)
+          .shadow({radius: 10, color: 0x20000000, offsetX: 5, offsetY: 5})
+          .stateStyles({
+            pressed:{
+              .brightness(0.8)
+              .scale({x:0.96 , y:0.96})
+            },
+            normal:{
+              .brightness(1.0)
+              .scale({ x: 1.0, y: 1.0 })
+            }
+          })
+          .animation({ curve: Curve.Sharp, duration: 150 })
+          .margin({
+            bottom:40
+          })
+          .onClick(async ()=>{
+            this.handleStartDetection()
+            animateTo({duration:300}, ()=>{
+              this.isShowResult = true;
+            })
+          })
+        }
+        .width('100%')
+        .height('100%')
+
+      }
+      .width('100%')
+      .height('100%')
+    }
+    .hideTitleBar(true)
+    .onDisAppear(async ()=>{
+      console.log('[UI] 页面销毁，准备释放资源');
+      this.cameraService.stopDetection();
+      await this.cameraService.releaseCamera();
+    })
+  }
+
+  // 【新增】pixelMap预处理（适配你的25类模型：224×224、RGB、归一化）
+  private async preprocessPixelMap(pixelMap: image.P<Float32Array> {
+    try {
+      // 1. 调整尺寸为模型输入尺寸（224×224，和你训练时一致）
+      const resizedPixel = await pixelMap.resize({ width: 224, height: 224 });
+      // 2. 转换为RGB通道（去除Alpha通道，模型输入要求）
+      const rgbPixel = await resizedPixel.convertToRGB();
+      // 3. 读取像素数据（Uint8Array，0-255）
+      const pixelBuffer = await rgbPixel.readPixels();
+      // 4. 归一化（转换为Float32Array，0-1范围，适配模型训练时的预处理）
+      const inputArray = new Float32Array(pixelBuffer.length);
+      for (let i = 0; i< pixelBuffer.length; i++) {
+        inputArray[i] = pixelBuffer[i] / 255.0;
+      }
+      return inputArray;
+    } catch (error) {
+      console.error('pixelMap预处理失败', error);
+      throw error; // 抛出错误，让上层处理
+    }
+  }
+
+  // 【修改】runAiModelInference：只获取缺陷类型数据，能效等级通过回调传递给handleStartDetection
+  private async runAiModelInference(pixelMap: image.PixelMap, energyLevelCallback: Energy<DetectionResult[]> {
+    try {
+      // 1. 先对pixelMap进行预处理（适配模型输入）
+      const inputData = await this.preprocessPixelMap(pixelMap);
+      // 2. 调用模型推理，获取原始置信度数组（长度25，对应25类）
+      let rawResults = await this.aiManager.runInference(inputData);
+      // 3. 解析置信度数组：找到置信度最高的类别（核心解析逻辑）
+      let maxConfidence = 0;
+      let predictClassId = 0;
+      for (let i = 0; i< rawResults.length; i++) {
+        if (rawResults[i] > maxConfidence) {
+          maxConfidence = rawResults[i];
+          predictClassId = i;
+        }
+      }
+      // 4. 映射类别名称（从CLASS_MAP中获取，和训练时一致）
+      const predictClassName = CLASS_MAP[predictClassId];
+      // 5. 拆分能效等级和缺陷类型（格式：levelX_缺陷类型）
+      const [levelStr, defectTypeEn] = predictClassName.split('_');
+      // 6. 转换能效等级（level1→1，level2→2），通过回调传递给handleStartDetection
+      const energyLevel = parseInt(levelStr.replace('level', ''));
+      energyLevelCallback(energyLevel); // 关键：传递能效等级
+      // 7. 转换缺陷类型为中文，计算校验率（置信度转百分比）
+      const defectTypeCn = DEFECT_TYPE_MAP[defectTypeEn] || "未知缺陷";
+      const inspectionRate = (maxConfidence * 100).toFixed(2) + '%';
+      // 8. 判断是否有缺陷（normal为无缺陷，其余为有缺陷）
+      const hasDefect = defectTypeEn !== "normal";
+      // 9. 组装返回结果（只包含缺陷类型相关，符合要求）
+      let finalResults: DetectionResult[] = [
+        { label: '校验率', value: inspectionRate },
+        { label: '缺陷与否', value: hasDefect ? "不合格" : "合格" },
+      ];
+      // 10. 有缺陷时，新增缺陷类型字段
+      if (hasDefect) {
+        finalResults.push({
+          label: '缺陷类型',
+          value: defectTypeCn,
+          visible: true
+        });
+      }
+      // 偏移量暂用模拟值（后续可替换为实际检测数据）
+      finalResults.push({ label: '偏移量', value: '0.2mm' });
+      return finalResults;
+    } catch (error) {
+      console.error('推理出错', error);
+      return [
+        { label: '状态', value: '推理失败' }
+      ];
+    }
+  }
+
+  // 【修改】handleStartDetection：接收runAiModelInference传递的能效等级
+  private handleStartDetection() {
+    // 定义回调函数，接收能效等级
+    const energyLevelCallback = (energyLevel: number) => {
+      // 随机模拟合格与否（可后续替换为实际缺陷判断结果）
+      const hasDefectRandom = Math.random() > 0.5;
+      // 组装历史记录（能效等级来自模型解析，非随机）
+      const newRecord: HistoryItem = {
+        productId: 'SN-' + new Date().getTime().toString().slice(-6), // 模拟编号
+        productModel: 'KFR-35GW', // 模拟型号
+        isQualified: !hasDefectRandom, // 随机模拟合格与否
+        energyLevel: energyLevel, // 关键：使用模型解析的能效等级（非随机）
+        inspectionRate: 98.5,
+        hasDefect: hasDefectRandom,
+        defectType: hasDefectRandom ? '表面划痕' : undefined, // 后续可替换为模型解析的缺陷类型
+        offset: '0.2mm',
+      };
+      this.historyList.unshift(newRecord);
+    };
+
+    console.log('[UI] 点击开始检测按钮');
+    this.isShowResult = true;
+
+    // 调用 CameraService 的实时回调
+    this.cameraService.startRealtimeDetection(async (pixelMap: image.PixelMap) => {
+      console.log('[UI] 收到来自 CameraService 的 PixelMap');
+      this.frameCount++;
+      // --- 核心优化：节流处理 ---
+      // 这里的 callback 约每 33ms 触发一次 (30fps)
+      // 我们每 10 帧才处理一次 AI 逻辑，降低 CPU 负载
+      if (this.frameCount % 10 === 0) {
+        if (this.isInferring) {
+          pixelMap.release();
+          return;
+        }
+        // 上锁，表示开始处理当前帧
+        this.isInferring = true;
+
+        // 释放旧图！极其重要，防止内存泄漏
+        if (this.currentPixelMap) {
+          this.currentPixelMap.release();
+        }
+        // 1. 更新 UI 预览（如果需要显示当前分析的那一帧）
+        pixelMap.getImageInfo().then(info => {
+          console.info(`图片获取成功: ${info.size.width}x${info.size.height}`);
+        });
+        this.currentPixelMap = pixelMap
+
+        try {
+          // 2. 传入pixelMap和回调，调用模型推理（获取缺陷类型，传递能效等级）
+          let inferenceResults = await this.runAiModelInference(pixelMap, energyLevelCallback);
+
+          // 3. 将结果赋值给 results，ArkUI 自动触发重绘
+          animateTo({ duration: 200 }, () => {
+            this.results = inferenceResults;
+          });
+
+        } catch (error) {
+          console.error('[AI] 模型推理过程发生异常: ', error);
+        } finally {
+          // 4. 处理完毕，解锁，允许接收下一帧
+          this.isInferring = false;
+        }
+      } else {
+        // 不需要处理的帧，直接释放，避免内存溢出
+        pixelMap.release();
+      }
+    });
+  }
+}
